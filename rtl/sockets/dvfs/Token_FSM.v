@@ -21,6 +21,8 @@ module Token_FSM (
     freq_target,  //Output of FSM, to send to LDO
     neighbors_ID,  //From CSR, specifies W/E/N/S neighbors
     PM_network  //From CSR lists which accelerators IDs are part of PM network
+ //   thermal_overrun,      // NEW: flag from wrapper
+   
 );
 
 
@@ -39,6 +41,7 @@ module Token_FSM (
     input [7:0] token_counter_override;
     input [19:0] neighbors_ID;
     input [31:0] PM_network;
+    input thermal_overrun;    // NEW
     //-------------Output Ports----------------------------
     output packet_out;
     output [31:0] packet_out_val;
@@ -70,12 +73,30 @@ module Token_FSM (
     reg signed [6:0] token_counter;
     reg [31:0] PM_network_shifted;
 
+   // -----------Token contributor tracking (ring buffer) ------------------------------------
+    reg [4:0]  coin_src_addr   [3:0];
+    reg [6:0]  coin_src_amount [3:0];
+    reg [1:0]  coin_src_ptr;
+    reg [4:0]  coin_src_addr_next   [3:0];
+    reg [6:0]  coin_src_amount_next [3:0];
+    reg [1:0]  coin_src_ptr_next;
+    reg      valid_src       [3:0];  // Valid flag per contributor
+    reg      valid_src_next  [3:0];
+
+    // Pullback logic
+    reg [3:0] pullback_count, pullback_count_next;
+    reg       pull_triggered, pull_triggered_next;
+    reg [1:0] pullback_index, pullback_index_next;
+    reg       in_pullback_loop, in_pullback_loop_next;
+//------------------------------------------------------------------------------------------
     //-------------Internal Constants--------------------------
     parameter SIZE_COUNT = 11;
     parameter SIDE_COUNT = 5;
     parameter SIZE_TOKEN = 7;
     //parameter COUNT_MIN = 10;
     //parameter COUNT_MAX = 2000; Used for dynamic diming
+
+    parameter [6:0] RATIO_THRESHOLD = 7'd58; // ~90% of 64 max (scaled to 64)
 
     //-------------Internal Variables---------------------------
     reg         [SIZE_COUNT-1:0] refresh_count;
@@ -96,6 +117,12 @@ module Token_FSM (
     wire signed [          13:0] diva;
     wire signed [          13:0] divb;
     reg         [          31:0] PM_network_shifted_next;
+
+
+ // New cooldown state
+       reg [SIZE_COUNT-1:0] cooldown_cnt, cooldown_cnt_next; //new
+       reg                  cool_off_flag, cool_off_flag_next; //new
+
     wire        [           5:0] max_tokens_act;
     reg                          freeze_div;
     wire signed [           6:0] zerozero;
@@ -143,6 +170,22 @@ module Token_FSM (
             freq_target        <= 0;
             token_counter      <= 0;
             PM_network_shifted <= 0;
+           
+    //--------------------------------------
+            coin_src_ptr         <= 0;
+            pullback_count       <= 0;
+            pull_triggered       <= 0;
+            pullback_index       <= 0;
+            in_pullback_loop     <= 0;
+            
+            for (i = 0; i < 4; i = i + 1) begin
+                coin_src_addr[i]   <= 0;
+                coin_src_amount[i] <= 0;
+                valid_src[i]       <= 0;
+            end      
+            
+    //------------------------------------        
+
         end else begin
             refresh_count      <= refresh_count_next;
             side_count         <= side_count_next;
@@ -151,6 +194,21 @@ module Token_FSM (
             freq_target        <= freq_target_next;
             token_counter      <= tokens_next;
             PM_network_shifted <= PM_network_shifted_next;
+
+    //-----------------------------------------------------
+            coin_src_ptr       <= coin_src_ptr_next;
+            pullback_count     <= pullback_count_next;
+            pull_triggered     <= pull_triggered_next;
+            pullback_index     <= pullback_index_next;
+            in_pullback_loop   <= in_pullback_loop_next;
+
+            for (i = 0; i < 4; i = i + 1) begin
+                coin_src_addr[i]   <= coin_src_addr_next[i];
+                coin_src_amount[i] <= coin_src_amount_next[i];
+                valid_src[i]       <= valid_src_next[i];
+            end
+    //------------------------------------------------------        
+
         end
     end  // End Of Block OUTPUT_LOGIC
 
@@ -158,6 +216,8 @@ module Token_FSM (
         //Combinational output
 
         //Default
+        cooldown_cnt_next  = cooldown_cnt; //new
+        cool_off_flag_next = cool_off_flag; //new
         side_count_next         = side_count;
         refresh_count_next      = refresh_count + 1;
         refresh_rate_next       = refresh_rate;
@@ -169,8 +229,77 @@ module Token_FSM (
         PM_network_shifted_next = PM_network_shifted;
         freeze_div              = 0;
 
-        if (packet_in == 1 && packet_in_val[31] == 0 && enable == 1) begin  //Received update
+//————————————————————————————————————————————————————————————————————————————————————————————————
+        pullback_count_next     = pullback_count;
+        pull_triggered_next     = pull_triggered;
+        pullback_index_next     = pullback_index;
+        in_pullback_loop_next   = in_pullback_loop;
+        
+        for (i = 0; i < 4; i = i + 1) begin
+            coin_src_addr_next[i]   = coin_src_addr[i];
+            coin_src_amount_next[i] = coin_src_amount[i];
+            valid_src_next[i]       = valid_src[i];
+        end
+        coin_src_ptr_next = coin_src_ptr;
+// ————————————————————————————————————————————————————————————————————————————————————————————————————
+        coin_src_addr_next[coin_src_ptr]   = packet_in_addr;
+        coin_src_amount_next[coin_src_ptr] = packet_in_val[6:0];
+      //  coin_src_ptr_next                  = coin_src_ptr + 1;
+        coin_src_ptr_next                  = (coin_src_ptr + 1) & 2'b11; // Wrap pointer
+
+       if (packet_in == 1 && packet_in_val[31] == 0 && enable == 1) begin  //Received update
             tokens_next = token_counter + $signed(packet_in_val[6:0]);
+            valid_src_next[coin_src_ptr] = 1;
+//----------------------------------------
+        
+
+            // Pullback trigger logic based on token utilization
+        if (enable && max_tokens != 0 && token_counter[6] == 0) begin
+            if ((token_counter <<< 6) / max_tokens > RATIO_THRESHOLD) begin
+                if (!pull_triggered) begin
+                    pullback_count_next = 5;  // wait 5 cycles
+                    pull_triggered_next = 1;
+                end else if (pullback_count != 0) begin
+                    pullback_count_next = pullback_count - 1;
+                end
+            end else begin
+                pullback_count_next = 0;
+                pull_triggered_next = 0;
+            end
+        end
+       // Pullback Loop: Send Return Tokens
+        if (pull_triggered && pullback_count == 0) begin
+            in_pullback_loop_next = 1;
+            pullback_index_next   = 0;
+            pull_triggered_next   = 0;
+        end
+        
+        if (in_pullback_loop) begin
+            if (valid_src[pullback_index]) begin
+                // (send packet)
+            end
+            if (packet_out_ready && enable && valid_src[pullback_index]) begin
+                packet_out        = 1;
+                packet_out_addr   = coin_src_addr[pullback_index];
+                packet_out_val[31] = 0;  // Data packet
+                packet_out_val[6:0] = ~coin_src_amount[pullback_index] + 1;  // Two’s complement
+                tokens_next       = token_counter - coin_src_amount[pullback_index];
+        
+                if (pullback_index == 3)
+                    in_pullback_loop_next = 0;
+                else
+                    pullback_index_next = pullback_index + 1;
+            end
+                // Clear after use
+                valid_src_next[pullback_index]       = 0;
+                coin_src_amount_next[pullback_index] = 0;
+        end
+            // Skip rest of FSM while returning tokens
+                  disable COMBO;
+            end
+        
+//------------------------------------------            
+
             if (packet_in_val[6:0] == 0) begin
                 if ((refresh_rate + refresh_rate >> 1) <= refresh_rate_max)
                     refresh_rate_next = refresh_rate + refresh_rate >> 1;  //x1.5
